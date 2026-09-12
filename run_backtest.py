@@ -26,6 +26,9 @@ prices = download_close(UNIVERSE)
 spy_prices = download_close([BENCHMARK])[BENCHMARK].reindex(prices.index).ffill().dropna()
 prices = prices.reindex(spy_prices.index).ffill().dropna()
 
+# Save the exact market sample used by CI so research iterations are reproducible.
+prices.assign(SPY=spy_prices).to_csv(OUT / "market_data.csv")
+
 bt = backtest(
     prices,
     lookback=126,
