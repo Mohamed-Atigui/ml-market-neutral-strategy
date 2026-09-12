@@ -1,171 +1,210 @@
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
-TRADING_DAYS = 252
+PERIODS_PER_YEAR = 12
 
-
-def momentum_signal(prices: pd.DataFrame, lookback: int = 126, skip: int = 21) -> pd.DataFrame:
-    """Medium-term momentum: return from t-lookback to t-skip."""
-    if lookback <= skip:
-        raise ValueError("lookback must be greater than skip")
-    return prices.shift(skip) / prices.shift(lookback) - 1.0
-
-
-def rolling_vol(returns: pd.DataFrame, window: int = 63) -> pd.DataFrame:
-    """Annualized trailing volatility for each asset."""
-    return returns.rolling(window).std() * np.sqrt(TRADING_DAYS)
-
-
-def _rebalance_dates(index: pd.DatetimeIndex, frequency: str = "monthly") -> pd.DatetimeIndex:
-    if frequency == "daily":
-        return index
-    if frequency != "monthly":
-        raise ValueError("frequency must be 'daily' or 'monthly'")
-    s = pd.Series(index=index, data=np.arange(len(index)))
-    return s.groupby(index.to_period("M")).tail(1).index
+FEATURE_COLUMNS = [
+    "mom1",
+    "mom3",
+    "mom6",
+    "mom12",
+    "mom6_ex1",
+    "mom12_ex1",
+    "vol1",
+    "vol3",
+    "dd3",
+]
 
 
-def cross_sectional_weights(
-    prices: pd.DataFrame,
-    lookback: int = 126,
-    skip: int = 21,
-    vol_window: int = 63,
-    long_frac: float = 0.25,
-    short_frac: float = 0.25,
-    rebalance_frequency: str = "monthly",
-) -> pd.DataFrame:
-    """
-    Build dollar-neutral long/short weights.
-
-    At each rebalance date, rank assets by medium-term momentum, go long the
-    strongest names and short the weakest names, and inverse-volatility weight
-    positions within each side. Between rebalances, weights are held constant.
-    """
-    if prices.shape[1] < 4:
-        raise ValueError("At least four assets are required")
-
-    returns = prices.pct_change()
-    signal = momentum_signal(prices, lookback, skip)
-    vol = rolling_vol(returns, vol_window).replace(0, np.nan)
-
-    weights = pd.DataFrame(np.nan, index=prices.index, columns=prices.columns, dtype=float)
-    rebal_dates = set(_rebalance_dates(prices.index, rebalance_frequency))
-
-    for dt in prices.index:
-        if dt not in rebal_dates:
-            continue
-
-        s = signal.loc[dt].dropna()
-        v = vol.loc[dt].reindex(s.index).dropna()
-        s = s.reindex(v.index)
-        n = len(s)
-        if n < 4:
-            continue
-
-        k_long = max(1, int(np.ceil(n * long_frac)))
-        k_short = max(1, int(np.ceil(n * short_frac)))
-        longs = s.nlargest(k_long).index
-        shorts = s.nsmallest(k_short).index
-
-        row = pd.Series(0.0, index=prices.columns)
-        invv_l = (1.0 / v.loc[longs]).replace([np.inf, -np.inf], np.nan).dropna()
-        invv_s = (1.0 / v.loc[shorts]).replace([np.inf, -np.inf], np.nan).dropna()
-
-        if len(invv_l):
-            row.loc[invv_l.index] = 0.5 * invv_l / invv_l.sum()
-        if len(invv_s):
-            row.loc[invv_s.index] = -0.5 * invv_s / invv_s.sum()
-        weights.loc[dt] = row
-
-    return weights.ffill().fillna(0.0)
+def monthly_end_dates(prices: pd.DataFrame) -> pd.DatetimeIndex:
+    """Last available trading date of each calendar month."""
+    return prices.groupby(prices.index.to_period("M")).tail(1).index
 
 
-def apply_vol_target(
-    raw_strategy_returns: pd.Series,
-    base_weights: pd.DataFrame,
-    target_vol: float = 0.10,
-    vol_window: int = 63,
-    max_leverage: float = 2.0,
-):
-    """Scale portfolio exposure using only trailing realized strategy volatility."""
-    realized = raw_strategy_returns.rolling(vol_window).std() * np.sqrt(TRADING_DAYS)
-    leverage = (target_vol / realized.shift(1)).clip(lower=0.0, upper=max_leverage)
-    leverage = leverage.replace([np.inf, -np.inf], np.nan).fillna(1.0)
-    return base_weights.mul(leverage, axis=0), leverage
+def build_monthly_panel(prices: pd.DataFrame) -> pd.DataFrame:
+    """Create a leakage-safe cross-sectional ML panel from daily close prices."""
+    prices = prices.sort_index().copy()
+    daily_returns = prices.pct_change()
+    dates = monthly_end_dates(prices)
+    monthly_prices = prices.loc[dates]
 
-
-def backtest(
-    prices: pd.DataFrame,
-    lookback: int = 126,
-    skip: int = 21,
-    vol_window: int = 63,
-    target_vol: float = 0.10,
-    max_leverage: float = 2.0,
-    cost_bps: float = 5.0,
-    rebalance_frequency: str = "monthly",
-):
-    """Run a strictly lagged backtest with turnover-dependent transaction costs."""
-    asset_returns = prices.pct_change().fillna(0.0)
-
-    signal_weights = cross_sectional_weights(
-        prices,
-        lookback=lookback,
-        skip=skip,
-        vol_window=vol_window,
-        rebalance_frequency=rebalance_frequency,
-    )
-
-    executed_weights = signal_weights.shift(1).fillna(0.0)
-    raw_returns = (executed_weights * asset_returns).sum(axis=1)
-
-    scaled_weights, leverage = apply_vol_target(
-        raw_returns,
-        executed_weights,
-        target_vol=target_vol,
-        vol_window=vol_window,
-        max_leverage=max_leverage,
-    )
-
-    turnover = scaled_weights.diff().abs().sum(axis=1).fillna(0.0)
-    gross_returns = (scaled_weights * asset_returns).sum(axis=1)
-    costs = turnover * (cost_bps / 10000.0)
-    net_returns = gross_returns - costs
-
-    return {
-        "weights": scaled_weights,
-        "gross_returns": gross_returns,
-        "net_returns": net_returns,
-        "turnover": turnover,
-        "costs": costs,
-        "leverage": leverage,
+    feature_frames = {
+        "mom1": prices.pct_change(21).loc[dates],
+        "mom3": prices.pct_change(63).loc[dates],
+        "mom6": prices.pct_change(126).loc[dates],
+        "mom12": prices.pct_change(252).loc[dates],
+        "mom6_ex1": (prices.shift(21) / prices.shift(126) - 1.0).loc[dates],
+        "mom12_ex1": (prices.shift(21) / prices.shift(252) - 1.0).loc[dates],
+        "vol1": (daily_returns.rolling(21).std() * np.sqrt(252)).loc[dates],
+        "vol3": (daily_returns.rolling(63).std() * np.sqrt(252)).loc[dates],
+        "dd3": (prices / prices.rolling(63).max() - 1.0).loc[dates],
     }
 
+    # Target is the next calendar month's asset return. This is used only as a
+    # label for historical observations and never as an input feature.
+    target = monthly_prices.shift(-1) / monthly_prices - 1.0
 
-def max_drawdown(returns: pd.Series) -> float:
-    equity = (1.0 + returns.fillna(0.0)).cumprod()
-    drawdown = equity / equity.cummax() - 1.0
-    return float(drawdown.min())
+    rows = []
+    for dt in dates:
+        for asset in prices.columns:
+            row = {"date": dt, "asset": asset, "target_return": target.loc[dt, asset]}
+            for name, frame in feature_frames.items():
+                row[name] = frame.loc[dt, asset]
+            rows.append(row)
+
+    panel = pd.DataFrame(rows).dropna().reset_index(drop=True)
+    # Cross-sectional target strips the common market move from each training month.
+    panel["target_relative"] = panel["target_return"] - panel.groupby("date")[
+        "target_return"
+    ].transform("mean")
+    return panel
+
+
+def _rank_to_weights(month: pd.DataFrame, score_col: str, n_long: int, n_short: int) -> pd.Series:
+    """Construct a dollar-neutral, inverse-volatility long/short portfolio."""
+    assets = month["asset"].tolist()
+    weights = pd.Series(0.0, index=assets, dtype=float)
+
+    longs = month.nlargest(n_long, score_col)["asset"].tolist()
+    shorts = month.nsmallest(n_short, score_col)["asset"].tolist()
+    vol = month.set_index("asset")["vol3"]
+
+    inv_long = 1.0 / vol.loc[longs]
+    inv_short = 1.0 / vol.loc[shorts]
+    weights.loc[longs] = 0.5 * inv_long / inv_long.sum()
+    weights.loc[shorts] = -0.5 * inv_short / inv_short.sum()
+    return weights
+
+
+def _portfolio_return(month: pd.DataFrame, weights: pd.Series) -> float:
+    realized = month.set_index("asset")["target_return"]
+    return float((weights * realized.reindex(weights.index)).sum())
+
+
+def walk_forward_backtest(
+    prices: pd.DataFrame,
+    min_train_months: int = 24,
+    alpha: float = 1.0,
+    n_long: int = 3,
+    n_short: int = 3,
+    cost_bps: float = 5.0,
+):
+    """
+    Expanding-window cross-sectional Ridge strategy.
+
+    For every rebalance month, the model is trained only on prior months whose
+    outcomes are already known. It then predicts relative next-month returns,
+    goes long the top-ranked assets and short the bottom-ranked assets.
+    """
+    panel = build_monthly_panel(prices)
+    dates = sorted(panel["date"].unique())
+    assets = list(prices.columns)
+
+    model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
+    previous_weights = pd.Series(0.0, index=assets)
+    records = []
+    prediction_rows = []
+
+    for i, dt in enumerate(dates):
+        if i < min_train_months:
+            continue
+
+        train = panel[panel["date"].isin(dates[:i])]
+        current = panel[panel["date"] == dt].copy()
+
+        model.fit(train[FEATURE_COLUMNS], train["target_relative"])
+        current["prediction"] = model.predict(current[FEATURE_COLUMNS])
+
+        weights = _rank_to_weights(current, "prediction", n_long, n_short).reindex(assets).fillna(0.0)
+        gross_return = _portfolio_return(current, weights)
+        turnover = float((weights - previous_weights).abs().sum())
+        costs = turnover * cost_bps / 10000.0
+        net_return = gross_return - costs
+
+        current["weight"] = current["asset"].map(weights)
+        prediction_rows.append(current)
+        records.append(
+            {
+                "date": dt,
+                "gross_return": gross_return,
+                "net_return": net_return,
+                "turnover": turnover,
+                "cost": costs,
+            }
+        )
+        previous_weights = weights
+
+    returns = pd.DataFrame(records).set_index("date")
+    predictions = pd.concat(prediction_rows, ignore_index=True)
+    return {"returns": returns, "predictions": predictions, "panel": panel}
+
+
+def momentum_baseline_backtest(
+    prices: pd.DataFrame,
+    evaluation_dates,
+    n_long: int = 3,
+    n_short: int = 3,
+    cost_bps: float = 5.0,
+):
+    """Simple 6m-minus-1m momentum baseline evaluated on the same months."""
+    panel = build_monthly_panel(prices)
+    assets = list(prices.columns)
+    previous_weights = pd.Series(0.0, index=assets)
+    records = []
+
+    for dt in evaluation_dates:
+        current = panel[panel["date"] == dt].copy()
+        weights = _rank_to_weights(current, "mom6_ex1", n_long, n_short).reindex(assets).fillna(0.0)
+        gross_return = _portfolio_return(current, weights)
+        turnover = float((weights - previous_weights).abs().sum())
+        costs = turnover * cost_bps / 10000.0
+        records.append(
+            {
+                "date": dt,
+                "gross_return": gross_return,
+                "net_return": gross_return - costs,
+                "turnover": turnover,
+                "cost": costs,
+            }
+        )
+        previous_weights = weights
+
+    return pd.DataFrame(records).set_index("date")
 
 
 def performance_metrics(returns: pd.Series, turnover: pd.Series | None = None) -> dict:
+    """Annualized metrics for monthly returns."""
     r = returns.dropna()
-    if len(r) == 0:
+    if r.empty:
         raise ValueError("No returns available")
 
-    total = (1.0 + r).prod()
-    ann_ret = total ** (TRADING_DAYS / len(r)) - 1.0
-    ann_vol = r.std() * np.sqrt(TRADING_DAYS)
-    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+    cumulative = float((1.0 + r).prod())
+    annualized_return = cumulative ** (PERIODS_PER_YEAR / len(r)) - 1.0
+    annualized_volatility = float(r.std() * np.sqrt(PERIODS_PER_YEAR))
+    sharpe = annualized_return / annualized_volatility if annualized_volatility > 0 else np.nan
+    equity = (1.0 + r).cumprod()
+    max_drawdown = float((equity / equity.cummax() - 1.0).min())
 
-    out = {
-        "annualized_return": float(ann_ret),
-        "annualized_volatility": float(ann_vol),
+    metrics = {
+        "annualized_return": float(annualized_return),
+        "annualized_volatility": annualized_volatility,
         "sharpe_ratio": float(sharpe),
-        "max_drawdown": max_drawdown(r),
-        "cumulative_return": float(total - 1.0),
+        "max_drawdown": max_drawdown,
+        "cumulative_return": cumulative - 1.0,
     }
     if turnover is not None:
         aligned = turnover.reindex(r.index).fillna(0.0)
-        out["average_daily_turnover"] = float(aligned.mean())
-        out["annualized_turnover"] = float(aligned.mean() * TRADING_DAYS)
-    return out
+        metrics["average_monthly_turnover"] = float(aligned.mean())
+        metrics["annualized_turnover"] = float(aligned.mean() * PERIODS_PER_YEAR)
+    return metrics
+
+
+def mean_rank_ic(predictions: pd.DataFrame) -> float:
+    """Mean monthly Spearman rank correlation between prediction and realized return."""
+    values = []
+    for _, month in predictions.groupby("date"):
+        values.append(month["prediction"].corr(month["target_return"], method="spearman"))
+    return float(pd.Series(values).dropna().mean())
