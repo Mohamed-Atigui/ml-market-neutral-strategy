@@ -1,9 +1,14 @@
 from pathlib import Path
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
 import yfinance as yf
 
-from src.strategy import backtest, performance_metrics
+from src.strategy import (
+    mean_rank_ic,
+    momentum_baseline_backtest,
+    performance_metrics,
+    walk_forward_backtest,
+)
 
 UNIVERSE = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK", "XLP", "XLRE", "XLU", "XLV", "XLY"]
 BENCHMARK = "SPY"
@@ -23,65 +28,76 @@ def download_close(tickers):
 
 
 prices = download_close(UNIVERSE)
-spy_prices = download_close([BENCHMARK])[BENCHMARK].reindex(prices.index).ffill().dropna()
-prices = prices.reindex(spy_prices.index).ffill().dropna()
+spy = download_close([BENCHMARK])[BENCHMARK].reindex(prices.index).ffill().dropna()
+prices = prices.reindex(spy.index).ffill().dropna()
+prices.assign(SPY=spy).to_csv(OUT / "market_data.csv")
 
-# Save the exact market sample used by CI so research iterations are reproducible.
-prices.assign(SPY=spy_prices).to_csv(OUT / "market_data.csv")
-
-bt = backtest(
+ml = walk_forward_backtest(
     prices,
-    lookback=126,
-    skip=21,
-    vol_window=63,
-    target_vol=0.10,
-    max_leverage=2.0,
+    min_train_months=24,
+    alpha=1.0,
+    n_long=3,
+    n_short=3,
     cost_bps=5.0,
-    rebalance_frequency="monthly",
 )
+strategy = ml["returns"]
+ml["predictions"].to_csv(OUT / "predictions.csv", index=False)
 
-spy_returns = spy_prices.pct_change().fillna(0.0)
+baseline = momentum_baseline_backtest(prices, strategy.index, cost_bps=5.0)
+
+# SPY next-month returns aligned to the same signal dates as the strategy.
+spy_monthly = spy.loc[spy.groupby(spy.index.to_period("M")).tail(1).index]
+spy_forward = spy_monthly.shift(-1) / spy_monthly - 1.0
+spy_forward = spy_forward.reindex(strategy.index).dropna()
+common = strategy.index.intersection(spy_forward.index)
+strategy = strategy.loc[common]
+baseline = baseline.loc[common]
+spy_forward = spy_forward.loc[common]
 
 metrics = pd.DataFrame(
     {
-        "strategy_gross": performance_metrics(bt["gross_returns"], bt["turnover"]),
-        "strategy_net": performance_metrics(bt["net_returns"], bt["turnover"]),
-        "SPY": performance_metrics(spy_returns),
+        "ridge_ml_net": performance_metrics(strategy["net_return"], strategy["turnover"]),
+        "momentum_baseline_net": performance_metrics(baseline["net_return"], baseline["turnover"]),
+        "SPY": performance_metrics(spy_forward),
     }
 )
+metrics.loc["mean_rank_ic", "ridge_ml_net"] = mean_rank_ic(ml["predictions"])
 metrics.to_csv(OUT / "metrics.csv")
 
 split = "2024-01-01"
 period_metrics = pd.DataFrame(
     {
-        "train_2017_2023": performance_metrics(bt["net_returns"].loc[:"2023-12-31"]),
-        "test_2024_present": performance_metrics(bt["net_returns"].loc[split:]),
+        "train_pre_2024": performance_metrics(strategy.loc[:"2023-12-31", "net_return"]),
+        "test_2024_present": performance_metrics(strategy.loc[split:, "net_return"]),
     }
 )
 period_metrics.to_csv(OUT / "train_test_metrics.csv")
 
-eq = pd.DataFrame(
+returns = pd.DataFrame(
     {
-        "strategy_gross": (1 + bt["gross_returns"]).cumprod(),
-        "strategy_net": (1 + bt["net_returns"]).cumprod(),
-        "SPY": (1 + spy_returns).cumprod(),
+        "ridge_ml_net": strategy["net_return"],
+        "momentum_baseline_net": baseline["net_return"],
+        "SPY": spy_forward,
     }
 )
-eq.to_csv(OUT / "equity_curve.csv")
+returns.to_csv(OUT / "monthly_returns.csv")
+
+equity = (1.0 + returns).cumprod()
+equity.to_csv(OUT / "equity_curve.csv")
 
 plt.figure(figsize=(10, 5))
-eq.plot(ax=plt.gca())
-plt.title("Market-neutral momentum vs SPY")
+equity.plot(ax=plt.gca())
+plt.title("Walk-forward Ridge strategy vs baselines")
 plt.ylabel("Growth of $1")
 plt.tight_layout()
 plt.savefig(OUT / "equity_curve.png", dpi=160)
 plt.close()
 
-net_eq = eq["strategy_net"]
-drawdown = net_eq / net_eq.cummax() - 1.0
+strategy_equity = equity["ridge_ml_net"]
+drawdown = strategy_equity / strategy_equity.cummax() - 1.0
 plt.figure(figsize=(10, 4))
 drawdown.plot(ax=plt.gca())
-plt.title("Net strategy drawdown")
+plt.title("Ridge ML strategy drawdown")
 plt.ylabel("Drawdown")
 plt.tight_layout()
 plt.savefig(OUT / "drawdown.png", dpi=160)
