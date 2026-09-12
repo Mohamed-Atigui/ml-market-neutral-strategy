@@ -1,0 +1,51 @@
+name: Quant research CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Unit tests
+        run: pytest -q
+
+      - name: Run real-data backtest
+        run: python run_backtest.py
+
+      - name: Execute notebook end-to-end
+        run: |
+          jupyter nbconvert \
+            --to notebook \
+            --execute notebooks/market_neutral_momentum.ipynb \
+            --output executed_market_neutral_momentum.ipynb \
+            --ExecutePreprocessor.timeout=900
+
+      - name: Upload research outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: quant-research-results
+          path: |
+            results/
+            notebooks/executed_market_neutral_momentum.ipynb
